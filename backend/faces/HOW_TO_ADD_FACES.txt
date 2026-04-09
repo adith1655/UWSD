@@ -1,0 +1,43 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  UWSD Face Database — How to Add Known Persons
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FOLDER STRUCTURE
+─────────────────
+faces/
+  ├── Aarav_Sharma/          ← one folder per person (use underscore for spaces)
+  │     ├── photo1.jpg
+  │     ├── photo2.jpg       ← multiple photos = better accuracy
+  │     └── photo3.jpg
+  │
+  ├── Priya_Patel/
+  │     └── priya.jpg
+  │
+  └── Your_Name/
+        └── selfie.jpg
+
+HOW TO ADD A PERSON
+────────────────────
+1. Create a new folder inside  faces/  named  FirstName_LastName
+   (use underscores, not spaces)
+
+2. Copy 1–5 clear front-facing photos of the person into that folder.
+   Supported formats: .jpg  .jpeg  .png
+
+3. Restart the backend  (or it will auto-detect on next WebSocket frame).
+   The system rebuilds its recognition index automatically.
+
+TIPS FOR BETTER ACCURACY
+─────────────────────────
+• Use well-lit, front-facing photos
+• Avoid sunglasses or heavy makeup in registration photos
+• 3–5 photos per person gives much better recognition than 1
+• Photos should show the face clearly (at least 100×100 pixels)
+• Mix lighting conditions if possible (indoor + outdoor)
+
+REMOVING A PERSON
+──────────────────
+Simply delete their folder from  faces/  and restart the backend.
+You can also use the Delete button in the Live Feed UI.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

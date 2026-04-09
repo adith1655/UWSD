@@ -1,0 +1,90 @@
+# ========================
+# Python / Backend
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Model weights (large binary files — download separately)
+*.pt
+*.pth
+*.pkl
+*.h5
+*.onnx
+
+# ========================
+# Logs
+# ========================
+backend/logs/*.log
+backend/logs/*.txt
+*.log
+
+# ========================
+# Face data (private / personal)
+# ========================
+backend/faces/*/
+!backend/faces/Add_New_Person_Here/
+!backend/faces/HOW_TO_ADD_FACES.txt
+
+# ========================
+# Environment / Secrets
+# ========================
+.env
+.env.*
+!.env.example
+*.env
+
+# ========================
+# Next.js / Frontend
+# ========================
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+frontend/tsconfig.tsbuildinfo
+frontend/.turbo/
+
+# Next.js build output
+.next/
+out/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ========================
+# OS / Editor
+# ========================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ========================
+# Misc
+# ========================
+*.tmp
+*.bak
+*.orig
+.cache/

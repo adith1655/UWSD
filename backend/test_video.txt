@@ -1,0 +1,5 @@
+# Test video file - place your test video here
+# Supported formats: .mp4, .avi, .mov, .mkv
+
+# For testing, you can download a sample video or use a webcam
+# To use webcam, set source_type: "webcam" in config.yaml
