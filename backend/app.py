@@ -30,8 +30,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 ALERT_EMAIL_TO   = "aakashchy018@gmail.com"
 # Fill these in with a Gmail account + App Password
 # (Google Account → Security → 2FA → App Passwords → generate one)
-SMTP_FROM        = os.getenv("UWSD_SMTP_FROM", "")
-SMTP_PASSWORD    = os.getenv("UWSD_SMTP_PASSWORD", "")
+SMTP_FROM        = os.getenv("UWSD_SMTP_FROM", "adithnambiar27@gmail.com")
+SMTP_PASSWORD    = os.getenv("UWSD_SMTP_PASSWORD", "vwbv jnbe ydgg clih")
 SMTP_HOST        = "smtp.gmail.com"
 SMTP_PORT        = 587
 _last_email_ts: dict[str, float] = {}   # type → last sent timestamp

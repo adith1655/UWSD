@@ -264,5 +264,3 @@ This project is developed by Team UWSD 2026 at Manipal University Jaipur.
 ---
 
 *"We are not building a security system — we are building a system that thinks, predicts, and protects."*
-#   U W S D  
- 
