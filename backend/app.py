@@ -1129,7 +1129,13 @@ _ocr_reader = None
 def _get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
-        import easyocr
+        try:
+            import easyocr
+        except ImportError as e:
+            raise HTTPException(
+                status_code=503,
+                detail="EasyOCR is not installed. Run: pip install easyocr",
+            ) from e
         _ocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _ocr_reader
 
@@ -1153,14 +1159,41 @@ def _format_plate(raw: str) -> str:
     return n
 
 
-def _extract_plates_from_frame(frame, reader) -> list[str]:
-    results = reader.readtext(frame, detail=0, paragraph=False)
-    plates = []
-    for text in results:
-        text_clean = text.upper().replace('O', '0').replace('I', '1')
-        for m in _PLATE_RE.finditer(text_clean):
-            plates.append(_format_plate(m.group(1)))
-    return plates
+def _prepare_frame_for_ocr(frame_bgr):
+    """Upscale very small frames so plate text has enough pixels for OCR."""
+    h, w = frame_bgr.shape[:2]
+    m = min(h, w)
+    if m < 480 and m > 0:
+        scale = 480 / m
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        frame_bgr = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    return frame_bgr
+
+
+def _extract_plates_from_frame(frame_bgr, reader) -> list[str]:
+    """
+    EasyOCR expects RGB. OpenCV gives BGR — convert or OCR quality is poor.
+    OCR often splits a plate across boxes; also scan joined text.
+    Do not globally replace O→0 / I→1: that breaks series codes like CA, CO, BH.
+    """
+    frame_bgr = _prepare_frame_for_ocr(frame_bgr)
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    results = reader.readtext(frame_rgb, detail=0, paragraph=False)
+    fragments = [str(t).strip().upper() for t in results if t and str(t).strip()]
+    if not fragments:
+        return []
+    # Single string of all detections (handles split "RJ14" + "CA 7742")
+    blobs = fragments + [" ".join(fragments)]
+    found: list[str] = []
+    seen: set[str] = set()
+    for blob in blobs:
+        for m in _PLATE_RE.finditer(blob):
+            plate = _format_plate(m.group(1))
+            key = _normalise_plate(plate)
+            if key not in seen:
+                seen.add(key)
+                found.append(plate)
+    return found
 
 
 @app.post("/vehicles/analyze-video")
@@ -1189,12 +1222,14 @@ async def analyze_video(
         sample_every = max(1, int(fps))          # one frame per second
         detected: dict[str, int] = {}            # plate -> frame count
         frame_idx = 0
+        frames_sampled = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             if frame_idx % sample_every == 0:
+                frames_sampled += 1
                 plates = _extract_plates_from_frame(frame, reader)
                 for p in plates:
                     detected[p] = detected.get(p, 0) + 1
@@ -1204,8 +1239,11 @@ async def analyze_video(
     finally:
         os.unlink(tmp_path)
 
-    # Only trust plates seen in ≥2 sampled frames (reduces false positives)
-    confirmed = [p for p, cnt in detected.items() if cnt >= 2]
+    # ≥2 frames when we have enough samples (cuts noise); single hit OK for short clips
+    if frames_sampled >= 3:
+        confirmed = [p for p, cnt in detected.items() if cnt >= 2]
+    else:
+        confirmed = [p for p, cnt in detected.items() if cnt >= 1]
 
     added, updated, already_parked = [], [], []
     now_ts = datetime.now(timezone.utc).isoformat()
@@ -1241,7 +1279,7 @@ async def analyze_video(
 
     return {
         "framesProcessed": frame_idx,
-        "framesSampled": frame_idx // sample_every,
+        "framesSampled": frames_sampled,
         "detectedPlates": list(detected.keys()),
         "confirmedPlates": confirmed,
         "added": added,

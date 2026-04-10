@@ -112,7 +112,16 @@ export const api = {
     }).then(async (res) => {
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || "Request failed");
+        const d = err.detail;
+        const msg =
+          typeof d === "string"
+            ? d
+            : Array.isArray(d)
+              ? d.map((x: { msg?: string }) => x?.msg || JSON.stringify(x)).join("; ")
+              : d
+                ? String(d)
+                : res.statusText;
+        throw new Error(msg || "Request failed");
       }
       return res.json();
     });
