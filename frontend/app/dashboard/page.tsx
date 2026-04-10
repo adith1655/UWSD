@@ -21,17 +21,25 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
+import { useRouter } from "next/navigation";
 
 export default function DashboardPage() {
+  const router  = useRouter();
   const [stats, setStats] = useState<any>(null);
   const [traffic, setTraffic] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
 
   useEffect(() => {
+    // Students and guards are redirected away by layout, but double-check here
+    const user = getStoredUser();
+    if (user?.role === "student") { router.replace("/dashboard/parcels"); return; }
+    if (user?.role === "guard")   { router.replace("/dashboard/live");    return; }
+
     api.getDashboardStats().then(setStats).catch(() => setStats(mockDashboardStats));
     api.getHourlyTraffic().then(setTraffic).catch(() => setTraffic(mockHourlyTraffic));
     api.getAccessLogs().then(setLogs).catch(() => setLogs(mockAccessLogs));
-  }, []);
+  }, [router]);
 
   if (!stats) {
     return (

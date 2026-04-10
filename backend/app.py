@@ -37,7 +37,7 @@ SMTP_PORT        = 587
 _last_email_ts: dict[str, float] = {}   # type → last sent timestamp
 
 # ── single worker so frames are processed sequentially ───────────────────────
-_executor = ThreadPoolExecutor(max_workers=1)
+_executor = ThreadPoolExecutor(max_workers=2)
 
 FACES_DIR = Path(__file__).parent / "faces"
 FACES_DIR.mkdir(exist_ok=True)
@@ -46,7 +46,27 @@ FACES_DIR.mkdir(exist_ok=True)
 # Each entry: {"name": str, "embedding": np.ndarray}
 _face_embeddings: list[dict] = []
 _embed_lock      = threading.Lock()
-_deepface_ready  = False          # True once model is warm
+_deepface_ready  = False          # True once Facenet512 model is warm
+
+# ── MediaPipe face detector (preferred; falls back to Haar) ───────────────────
+_mp_face_detection = None
+try:
+    # mediapipe >= 0.10 moved face detection to mediapipe.tasks
+    import mediapipe as mp
+    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+        _mp_face_detection = mp.solutions.face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.5,
+        )
+        print("[UWSD] MediaPipe face detector loaded (legacy API)")
+    else:
+        print("[UWSD] MediaPipe installed but API changed — using Haar cascade (sufficient for recognition)")
+except Exception as _mp_err:
+    print(f"[UWSD] MediaPipe not available ({_mp_err}), using Haar cascade fallback")
+
+# Haar-cascade (fallback only) ─────────────────────────────────────────────────
+_haar = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 
 def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
@@ -104,54 +124,77 @@ def send_email_alert(alert: dict):
 def reload_embeddings():
     """
     Build in-memory embedding table from every image in FACES_DIR.
-    Called at startup and after every register/delete.
+    Uses the same detector_backend='opencv' + align=True as run_detection
+    so live embeddings are directly comparable to stored ones.
+    Also stores a brightness-boosted variant for dim-webcam robustness.
     """
     global _face_embeddings, _deepface_ready
     from deepface import DeepFace
+
+    def _embed(img: np.ndarray, name: str, out: list):
+        try:
+            reps = DeepFace.represent(
+                img_path=img,
+                model_name="Facenet512",
+                detector_backend="opencv",
+                enforce_detection=False,
+                align=True,
+            )
+            for rep in reps:
+                out.append({
+                    "name":      name,
+                    "embedding": np.array(rep["embedding"], dtype=np.float32),
+                })
+        except Exception as e:
+            print(f"[UWSD] embed error for {name}: {str(e).encode('ascii', 'replace').decode('ascii')}")
 
     new_embeddings: list[dict] = []
     for person_dir in sorted(FACES_DIR.iterdir()):
         if not person_dir.is_dir():
             continue
-        name  = person_dir.name.replace("_", " ")
-        imgs  = (list(person_dir.glob("*.jpg"))
-                 + list(person_dir.glob("*.jpeg"))
-                 + list(person_dir.glob("*.png")))
+        name = person_dir.name.replace("_", " ")
+        imgs = (list(person_dir.glob("*.jpg"))
+                + list(person_dir.glob("*.jpeg"))
+                + list(person_dir.glob("*.png")))
         for img_path in imgs:
-            try:
-                reps = DeepFace.represent(
-                    img_path=str(img_path),
-                    model_name="Facenet512",
-                    detector_backend="opencv",
-                    enforce_detection=False,
-                    align=True,
-                )
-                for rep in reps:
-                    new_embeddings.append({
-                        "name":      name,
-                        "embedding": np.array(rep["embedding"], dtype=np.float32),
-                    })
-            except Exception:
-                pass
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+            _embed(img, name, new_embeddings)
+            # Brightness boost variant — helps match dim webcam feeds
+            bright = cv2.convertScaleAbs(img, alpha=1.2, beta=15)
+            _embed(bright, name, new_embeddings)
 
     with _embed_lock:
         _face_embeddings = new_embeddings
     _deepface_ready = True
-    print(f"[UWSD] Embeddings loaded: {len(new_embeddings)} vector(s) "
-          f"for {len({e['name'] for e in new_embeddings})} person(s)")
+    n_persons = len({e["name"] for e in new_embeddings})
+    print(f"[UWSD] Embeddings loaded: {len(new_embeddings)} vector(s) for {n_persons} person(s)")
 
 
 def _match_embedding(query: np.ndarray) -> tuple[str, float, bool]:
-    """Return (name, confidence, is_known) using cosine distance."""
-    THRESHOLD = 0.30
+    """
+    Return (name, confidence, is_known).
+    Aggregates multiple embeddings per person (best distance per person).
+    Facenet512 cosine distance: same-person ≈ 0.10-0.30, different ≈ 0.50+
+    """
+    THRESHOLD = 0.40   # Facenet512 cosine distance threshold
     with _embed_lock:
         if not _face_embeddings:
             return "Unknown", 0.0, False
-        dists = [(_cosine_dist(query, e["embedding"]), e["name"])
-                 for e in _face_embeddings]
-    best_dist, best_name = min(dists, key=lambda t: t[0])
+        # Per-person minimum distance (handles multiple photos per person)
+        person_best: dict[str, float] = {}
+        for e in _face_embeddings:
+            d = _cosine_dist(query, e["embedding"])
+            name = e["name"]
+            if name not in person_best or d < person_best[name]:
+                person_best[name] = d
+
+    best_name = min(person_best, key=person_best.__getitem__)
+    best_dist = person_best[best_name]
     if best_dist < THRESHOLD:
-        return best_name, round(1.0 - best_dist, 2), True
+        confidence = round(1.0 - (best_dist / THRESHOLD), 2)
+        return best_name, max(0.01, confidence), True
     return "Unknown", 0.0, False
 
 
@@ -165,7 +208,7 @@ def _match_visitor_embedding(query: np.ndarray) -> tuple[str | None, str | None,
     Match a face embedding against pre-registered visitor embeddings.
     Returns (visitor_id, name, confidence, is_within_time_window).
     """
-    THRESHOLD = 0.35   # slightly relaxed for selfie-vs-camera variance
+    THRESHOLD = 0.45   # slightly relaxed for selfie-vs-camera variance (Facenet512)
     with _visitor_embed_lock:
         if not _visitor_embeddings:
             return None, None, 0.0, False
@@ -204,89 +247,61 @@ def _clear_cache():
             pass
 
 
-# Haar-cascade for fast face detection ────────────────────────────────────────
-_haar = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
-
-
 def run_detection(frame: np.ndarray) -> list[dict]:
     """
-    Fast pipeline:
-      1. Resize frame to max 480 wide for detection.
-      2. Haar-cascade detects face bounding boxes (very fast, CPU-only).
-      3. For each face crop → DeepFace.represent (Facenet512, skip detector).
-      4. Cosine match against in-memory embeddings.
+    Consistent pipeline — uses DeepFace on the full frame exactly like reload_embeddings.
+    This guarantees the live embedding and the stored embedding go through identical
+    detection + alignment, so cosine distances are meaningful.
     """
     from deepface import DeepFace
 
-    # ── downscale for detection ───────────────────────────────────────────
-    h_orig, w_orig = frame.shape[:2]
-    scale   = min(1.0, 480 / max(w_orig, 1))
-    small   = cv2.resize(frame, (int(w_orig * scale), int(h_orig * scale)))
-    gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    cv2.equalizeHist(gray, gray)
-
-    faces_haar = _haar.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5,
-        minSize=(40, 40), flags=cv2.CASCADE_SCALE_IMAGE,
-    )
+    # While Facenet512 model warms up, use Haar to show faces as Unknown for UI feedback
+    if not _deepface_ready:
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cv2.equalizeHist(gray, gray)
+        faces = _haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        return [
+            {"bbox": [int(x), int(y), int(x + w), int(y + h)], "detection_conf": 0.85,
+             "name": "Loading...", "match_conf": 0.0, "is_known": False, "visitor_match": None}
+            for (x, y, w, h) in faces
+        ]
 
     detections: list[dict] = []
+    try:
+        reps = DeepFace.represent(
+            img_path=frame,
+            model_name="Facenet512",
+            detector_backend="opencv",   # identical to reload_embeddings
+            enforce_detection=False,
+            align=True,
+        )
+    except Exception as e:
+        print(f"[UWSD] run_detection error: {e}")
+        return []
 
-    if len(faces_haar) == 0:
-        return detections
+    for rep in reps:
+        query = np.array(rep["embedding"], dtype=np.float32)
+        name, match_conf, is_known = _match_embedding(query)
 
-    for (fx, fy, fw, fh) in faces_haar:
-        # Map back to original resolution
-        x  = int(fx / scale);  y  = int(fy / scale)
-        w  = int(fw / scale);  h  = int(fh / scale)
+        fa = rep.get("facial_area", {})
+        x  = fa.get("x", 0);  y = fa.get("y", 0)
+        fw = fa.get("w", 80); fh = fa.get("h", 80)
 
-        # Expand crop slightly for better embedding quality
-        pad    = int(0.15 * max(w, h))
-        x1     = max(0,       x - pad)
-        y1     = max(0,       y - pad)
-        x2     = min(w_orig,  x + w + pad)
-        y2     = min(h_orig,  y + h + pad)
-        crop   = frame[y1:y2, x1:x2]
-
-        if crop.size == 0:
-            continue
-
-        name         = "Unknown"
-        match_conf   = 0.0
-        is_known     = False
-        det_conf     = 0.90   # Haar doesn't give per-face confidence
-        visitor_match = None   # smart visitor match info
-
-        if _deepface_ready:
-            try:
-                reps = DeepFace.represent(
-                    img_path=crop,
-                    model_name="Facenet512",
-                    detector_backend="skip",      # crop is already the face
-                    enforce_detection=False,
-                    align=False,
-                )
-                if reps:
-                    query = np.array(reps[0]["embedding"], dtype=np.float32)
-                    # 1) Check registered hostel faces first
-                    if _face_embeddings:
-                        name, match_conf, is_known = _match_embedding(query)
-                    # 2) If not a known resident, check visitor embeddings
-                    if not is_known:
-                        vid, vname, vconf, in_window = _match_visitor_embedding(query)
-                        if vid:
-                            visitor_match = {"visitor_id": vid, "name": vname, "confidence": vconf, "in_window": in_window}
-                            name       = f"Visitor: {vname}"
-                            match_conf = vconf
-                            is_known   = True
-            except Exception:
-                pass
+        visitor_match = None
+        if not is_known:
+            vid, vname, vconf, in_window = _match_visitor_embedding(query)
+            if vid:
+                visitor_match = {
+                    "visitor_id": vid, "name": vname,
+                    "confidence": vconf, "in_window": in_window,
+                }
+                name       = f"Visitor: {vname}"
+                match_conf = vconf
+                is_known   = True
 
         detections.append({
-            "bbox":           [x, y, x + w, y + h],
-            "detection_conf": det_conf,
+            "bbox":           [x, y, x + fw, y + fh],
+            "detection_conf": 0.92,
             "name":           name,
             "match_conf":     match_conf,
             "is_known":       is_known,
@@ -314,7 +329,7 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 async def startup():
     global _main_loop
     _main_loop = asyncio.get_event_loop()
-    # Pre-warm DeepFace + load embeddings in background so first frame is fast
+    # Pre-warm SFace model + load embeddings in background so first frame is fast
     threading.Thread(target=reload_embeddings, daemon=True).start()
 
 
@@ -365,7 +380,7 @@ users_db = [
     {"id": "u2",  "name": "Priya Patel",        "email": "priya@muj.edu",   "password": "password", "role": "student", "room": "G-112", "photo": None, "isActive": True},
     {"id": "u3",  "name": "Rahul Verma",        "email": "rahul@muj.edu",   "password": "password", "role": "student", "room": "B-305", "photo": None, "isActive": True},
     {"id": "u4",  "name": "Sneha Gupta",        "email": "sneha@muj.edu",   "password": "password", "role": "student", "room": "G-208", "photo": None, "isActive": True},
-    {"id": "u5",  "name": "Vikram Singh",       "email": "vikram@muj.edu",  "password": "password", "role": "guard",   "room": None,    "photo": None, "isActive": True},
+    {"id": "u5",  "name": "Vikram Singh",       "email": "vikram@muj.edu",  "password": "password", "role": "warden",  "room": None,    "photo": None, "isActive": True},
     {"id": "u6",  "name": "Dr. Meera Joshi",    "email": "meera@muj.edu",   "password": "password", "role": "warden",  "room": None,    "photo": None, "isActive": True},
     {"id": "u7",  "name": "Amit Kumar",         "email": "amit@muj.edu",    "password": "password", "role": "admin",   "room": None,    "photo": None, "isActive": True},
     {"id": "u8",  "name": "Kavya Nair",         "email": "kavya@muj.edu",   "password": "password", "role": "student", "room": "G-301", "photo": None, "isActive": True},
@@ -373,6 +388,7 @@ users_db = [
     {"id": "u10", "name": "Ananya Reddy",       "email": "ananya@muj.edu",  "password": "password", "role": "student", "room": "G-205", "photo": None, "isActive": True},
     {"id": "u11", "name": "Suresh Babu",        "email": "suresh@muj.edu",  "password": "password", "role": "guard",   "room": None,    "photo": None, "isActive": True},
     {"id": "u12", "name": "Dr. Rakesh Tiwari",  "email": "rakesh@muj.edu",  "password": "password", "role": "warden",  "room": None,    "photo": None, "isActive": True},
+    {"id": "u13", "name": "Guard Officer",       "email": "guard@muj.edu",   "password": "password", "role": "guard",   "room": None,    "photo": None, "isActive": True},
 ]
 
 cameras_db = [
@@ -518,9 +534,8 @@ class LoginRequest(BaseModel):
 @app.post("/auth/login")
 def login(request: LoginRequest):
     user = next((u for u in users_db if u["email"] == request.email), None)
-    if not user:
+    if not user or user["password"] != request.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    # Any password accepted for demo
     token = create_access_token({"sub": user["id"], "role": user["role"]})
     return {"token": token, "user": _safe(user)}
 
@@ -720,7 +735,6 @@ def register_visitor(body: VisitorRegisterRequest, current_user=Depends(get_curr
                     emb = np.array(reps[0]["embedding"], dtype=np.float32)
                     visitor["hasFace"] = True
                     visitor["_embedding"] = emb
-                    # Add to live visitor embedding cache
                     with _visitor_embed_lock:
                         _visitor_embeddings.append({
                             "visitor_id": visitor["id"],
@@ -915,6 +929,20 @@ def reject_night_out(request_id: str, current_user=Depends(get_current_user)):
     req["status"] = "REJECTED"
     req["approvedBy"] = current_user["name"]
     return req
+
+
+@app.get("/my/night-outs")
+def get_my_night_outs(current_user=Depends(get_current_user)):
+    """Returns night-out requests belonging to the logged-in student."""
+    my = [n for n in night_outs_db if n.get("studentId") == current_user["id"]]
+    return sorted(my, key=lambda n: n["createdAt"], reverse=True)
+
+
+@app.get("/my/parcels")
+def get_my_parcels(current_user=Depends(get_current_user)):
+    """Returns parcels addressed to the logged-in student."""
+    my = [p for p in parcels_db if p.get("student_id") == current_user["id"]]
+    return sorted(my, key=lambda p: p["timestamp"], reverse=True)
 
 # ---------------------------------------------------------------------------
 # Parcels  (updated flow: guard logs → student looks up → guard verifies)
@@ -1320,15 +1348,41 @@ class RegisterFaceRequest(BaseModel):
 
 @app.post("/faces/register")
 def register_face(req: RegisterFaceRequest, current_user=Depends(get_current_user)):
-    person_dir = FACES_DIR / req.name.replace(" ", "_")
-    person_dir.mkdir(exist_ok=True)
+    if current_user["role"] not in ("admin", "warden"):
+        raise HTTPException(status_code=403, detail="Only wardens and admins can register faces")
 
     frame = decode_frame(req.image)
     if frame is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
+    # Validate that DeepFace can actually detect a face with the same pipeline
+    # used during live detection — so the saved embedding will match
+    from deepface import DeepFace
+    try:
+        test_reps = DeepFace.represent(
+            img_path=frame,
+            model_name="Facenet512",
+            detector_backend="opencv",
+            enforce_detection=True,
+            align=True,
+        )
+        if not test_reps:
+            raise HTTPException(status_code=400,
+                detail="No face detected. Make sure your face is clearly visible, well-lit, and facing the camera.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "Face could not be detected" in str(e) or "face" in str(e).lower():
+            raise HTTPException(status_code=400,
+                detail="No face detected. Make sure your face is clearly visible, well-lit, and facing the camera.")
+        # Other error — still save, reload will handle it
+        print(f"[UWSD] Face validation warning: {e}")
+
+    person_dir = FACES_DIR / req.name.replace(" ", "_")
+    person_dir.mkdir(exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    img_path = person_dir / f"{timestamp}.jpg"
+    img_path  = person_dir / f"{timestamp}.jpg"
     cv2.imwrite(str(img_path), frame)
     _clear_cache()
     threading.Thread(target=reload_embeddings, daemon=True).start()
@@ -1349,6 +1403,8 @@ def list_faces(current_user=Depends(get_current_user)):
 
 @app.delete("/faces/{name}")
 def delete_face(name: str, current_user=Depends(get_current_user)):
+    if current_user["role"] not in ("admin", "warden"):
+        raise HTTPException(status_code=403, detail="Only wardens and admins can delete faces")
     person_dir = FACES_DIR / name.replace(" ", "_")
     if not person_dir.exists():
         raise HTTPException(status_code=404, detail="Face not found")
@@ -1536,4 +1592,4 @@ def test_rtsp_url(body: dict, current_user=Depends(get_current_user)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

@@ -5,6 +5,7 @@ import Header from "@/components/header";
 import { mockParcels, mockUsers } from "@/lib/mock-data";
 import { formatRelativeTime, cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
 import {
   Package,
   CheckCircle,
@@ -63,19 +64,35 @@ export default function ParcelsPage() {
   const [verifyLoading, setVerifyLoading] = useState<string | null>(null);
 
   /* ── helpers ────────────────────────────────────────────────────────────── */
-  const isGuard = currentUser?.role === "guard" || currentUser?.role === "admin" || currentUser?.role === "warden";
+  const isGuard   = currentUser?.role === "guard" || currentUser?.role === "admin" || currentUser?.role === "warden";
+  const isStudent = currentUser?.role === "student";
 
   const load = useCallback(() => {
-    api.getParcels().then(setParcels).catch(() => setParcels(mockParcels as any));
-  }, []);
+    if (isStudent) {
+      api.getMyParcels().then(setParcels).catch(() =>
+        setParcels((mockParcels as any).filter((p: any) => p.student_id === currentUser?.id))
+      );
+    } else {
+      api.getParcels().then(setParcels).catch(() => setParcels(mockParcels as any));
+    }
+  }, [isStudent, currentUser?.id]);
 
   useEffect(() => {
-    load();
-    api.me().then(setCurrentUser).catch(() => setCurrentUser({ id: "u5", name: "Vikram Singh", role: "guard" }));
+    const stored = getStoredUser();
+    const user = stored ?? { id: "u5", name: "Vikram Singh", role: "guard" };
+    setCurrentUser(user);
     api.getUsers().then((u) => setStudents(u.filter((x: any) => x.role === "student"))).catch(() => {
       setStudents(mockUsers.filter((x: any) => x.role === "student"));
     });
-  }, [load]);
+    // Load parcels immediately with resolved user role
+    if (user.role === "student") {
+      api.getMyParcels().then(setParcels).catch(() =>
+        setParcels((mockParcels as any).filter((p: any) => p.student_id === user.id))
+      );
+    } else {
+      api.getParcels().then(setParcels).catch(() => setParcels(mockParcels as any));
+    }
+  }, []);
 
   /* ── Log parcel (guard) ────────────────────────────────────────────────── */
   const handleLogParcel = async (e: React.FormEvent) => {
@@ -173,7 +190,7 @@ export default function ParcelsPage() {
           <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-900 to-slate-900/50 p-5">
             <div className="absolute -right-3 -top-3 h-20 w-20 rounded-full bg-violet-500/5" />
             <ShieldCheck className="h-5 w-5 text-violet-400 mb-2" />
-            <p className="text-3xl font-bold text-violet-400">{isGuard ? "Guard" : "Student"}</p>
+            <p className="text-3xl font-bold text-violet-400 capitalize">{currentUser?.role ?? "—"}</p>
             <p className="text-xs text-slate-500 mt-1 font-medium uppercase tracking-wider">Role</p>
           </div>
         </div>

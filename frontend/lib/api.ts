@@ -119,4 +119,18 @@ export const api = {
   },
 
   getUsers: () => request<any[]>("/users"),
+
+  // Student-scoped endpoints
+  getMyParcels: () => request<any[]>("/my/parcels"),
+  getMyNightOuts: () => request<any[]>("/my/night-outs"),
+  createNightOut: (data: {
+    studentId: string;
+    studentName: string;
+    room?: string;
+    reason: string;
+    destination: string;
+    leaveDate: string;
+    returnDate: string;
+    returnTime: string;
+  }) => request<any>("/night-outs", { method: "POST", body: JSON.stringify(data) }),
 };

@@ -5,6 +5,7 @@ import Header from "@/components/header";
 import { mockCameras } from "@/lib/mock-data";
 import { cn, getStatusColor } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { getStoredUser } from "@/lib/auth";
 import {
   Camera, Circle, Maximize2, Volume2, RefreshCw,
   Video, VideoOff, UserPlus, Trash2, AlertTriangle, CheckCircle2, X,
@@ -41,8 +42,14 @@ function WebcamPanel() {
   const [faces,       setFaces]       = useState<RegisteredFace[]>([]);
   const [showRegister,setShowRegister]= useState(false);
   const [regName,     setRegName]     = useState("");
-  const [regLoading,  setRegLoading]  = useState(false);
-  const [regMsg,      setRegMsg]      = useState("");
+  const [regLoading,      setRegLoading]      = useState(false);
+  const [regMsg,          setRegMsg]          = useState("");
+  const [canManageFaces,  setCanManageFaces]  = useState(false);
+
+  useEffect(() => {
+    const u = getStoredUser();
+    setCanManageFaces(u?.role === "warden" || u?.role === "admin");
+  }, []);
 
   // Load registered faces
   const loadFaces = () =>
@@ -80,22 +87,31 @@ function WebcamPanel() {
         if (!ctx) return;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+        // Frames are sent at 480px wide — scale bbox back to canvas resolution
+        const sentScale = Math.min(1, 480 / (video.videoWidth || 480));
+        const sentW = Math.round((video.videoWidth  || 480) * sentScale);
+        const sentH = Math.round((video.videoHeight || 360) * sentScale);
+        const rx = canvas.width  / sentW;
+        const ry = canvas.height / sentH;
+
         for (const det of dets) {
           const [x1, y1, x2, y2] = det.bbox;
+          const cx1 = x1 * rx, cy1 = y1 * ry;
+          const cw  = (x2 - x1) * rx, ch = (y2 - y1) * ry;
           const color = det.is_known ? "#10b981" : "#ef4444";
           ctx.strokeStyle = color;
-          ctx.lineWidth   = 2;
-          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          ctx.lineWidth   = 3;
+          ctx.strokeRect(cx1, cy1, cw, ch);
 
           // Label background
           const label = det.is_known
             ? `${det.name} (${(det.match_conf * 100).toFixed(0)}%)`
             : "UNKNOWN";
+          ctx.font = "bold 14px monospace";
           ctx.fillStyle = color;
-          ctx.fillRect(x1, y1 - 22, ctx.measureText(label).width + 10, 22);
+          ctx.fillRect(cx1, cy1 - 24, ctx.measureText(label).width + 12, 24);
           ctx.fillStyle = "#fff";
-          ctx.font = "bold 13px monospace";
-          ctx.fillText(label, x1 + 5, y1 - 6);
+          ctx.fillText(label, cx1 + 6, cy1 - 7);
 
           // Alert for unknown
           if (!det.is_known) {
@@ -194,12 +210,14 @@ function WebcamPanel() {
           {active && <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">LIVE</span>}
         </div>
         <div className="flex gap-2">
-          <button
-            onClick={() => setShowRegister(s => !s)}
-            className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700 transition-colors"
-          >
-            <UserPlus className="h-3.5 w-3.5" /> Add Face
-          </button>
+          {canManageFaces && (
+            <button
+              onClick={() => setShowRegister(s => !s)}
+              className="flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700 transition-colors"
+            >
+              <UserPlus className="h-3.5 w-3.5" /> Add Face
+            </button>
+          )}
           <button
             onClick={active ? stopCamera : startCamera}
             className={cn(
@@ -293,9 +311,11 @@ function WebcamPanel() {
                     <span className="text-xs text-slate-300">{f.name}</span>
                     <div className="flex items-center gap-2">
                       <span className="text-[10px] text-slate-600">{f.photos} photo{f.photos !== 1 ? "s" : ""}</span>
-                      <button onClick={() => deleteFace(f.name)} className="text-slate-600 hover:text-red-400 transition-colors">
-                        <Trash2 className="h-3 w-3" />
-                      </button>
+                      {canManageFaces && (
+                        <button onClick={() => deleteFace(f.name)} className="text-slate-600 hover:text-red-400 transition-colors">
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -305,8 +325,8 @@ function WebcamPanel() {
         </div>
       </div>
 
-      {/* Register face modal */}
-      {showRegister && (
+      {/* Register face modal — warden/admin only */}
+      {showRegister && canManageFaces && (
         <div className="border-t border-slate-800 p-4 bg-slate-900/50">
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm font-semibold text-white">Register New Face</p>

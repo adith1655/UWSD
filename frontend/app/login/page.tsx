@@ -19,10 +19,11 @@ export default function LoginPage() {
     setError("");
     try {
       const { api } = await import("@/lib/api");
+      const { defaultPathForRole } = await import("@/lib/auth");
       const data = await api.login(email, password);
       localStorage.setItem("uwsd_token", data.token);
       localStorage.setItem("uwsd_user", JSON.stringify(data.user));
-      router.push("/dashboard");
+      router.push(defaultPathForRole(data.user.role));
     } catch (err: any) {
       setError(err.message || "Login failed");
       setLoading(false);
@@ -151,17 +152,47 @@ export default function LoginPage() {
             <p className="text-center text-[10px] font-medium uppercase tracking-wider text-slate-600">
               Demo Credentials
             </p>
-            <div className="mt-2 space-y-1 text-center text-xs text-slate-500">
-              <p>
-                Guard: <span className="text-slate-400">vikram@muj.edu</span>
-              </p>
-              <p>
-                Warden: <span className="text-slate-400">meera@muj.edu</span>
-              </p>
-              <p>
-                Admin: <span className="text-slate-400">amit@muj.edu</span>
-              </p>
-              <p className="text-slate-600">Password: any</p>
+            <div className="mt-2 space-y-1.5 text-xs text-slate-500">
+              <div className="flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+                  Warden
+                </span>
+                <button
+                  type="button"
+                  onClick={() => { setEmail("vikram@muj.edu"); setPassword("password"); }}
+                  className="text-slate-400 hover:text-blue-400 transition-colors"
+                >
+                  vikram@muj.edu
+                </button>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-green-400" />
+                  Student
+                </span>
+                <button
+                  type="button"
+                  onClick={() => { setEmail("aarav@muj.edu"); setPassword("password"); }}
+                  className="text-slate-400 hover:text-green-400 transition-colors"
+                >
+                  aarav@muj.edu
+                </button>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
+                  Guard
+                </span>
+                <button
+                  type="button"
+                  onClick={() => { setEmail("guard@muj.edu"); setPassword("password"); }}
+                  className="text-slate-400 hover:text-amber-400 transition-colors"
+                >
+                  guard@muj.edu
+                </button>
+              </div>
+              <p className="text-center text-slate-600 pt-0.5">Password: password (click to fill)</p>
             </div>
           </div>
         </form>
