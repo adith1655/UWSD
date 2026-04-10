@@ -5,3 +5,4 @@ pydantic>=2.9.0
 deepface>=0.0.93
 opencv-python>=4.8.0
 onnxruntime>=1.16.0
+easyocr>=1.7.0
