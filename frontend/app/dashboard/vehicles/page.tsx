@@ -8,7 +8,7 @@ import { api } from "@/lib/api";
 import {
   Car, ShieldCheck, ShieldAlert, ShieldX, Upload, X,
   CheckCircle, AlertCircle, Loader2, Plus, Ban, UserPlus,
-  Circle, ParkingCircle, LogOut, Zap,
+  ParkingCircle, LogOut, Zap,
 } from "lucide-react";
 
 type Vehicle = {
@@ -31,6 +31,14 @@ type AnalysisResult = {
   added: string[];
   updated: string[];
   alreadyParked: string[];
+};
+
+type Job = {
+  jobId: string;
+  filename: string;
+  status: "processing" | "done" | "error";
+  result: AnalysisResult | null;
+  error: string | null;
 };
 
 function vehicleColor(v: Vehicle) {
@@ -103,17 +111,41 @@ export default function VehiclesPage() {
   const [addError, setAddError] = useState<string | null>(null);
   const [addSuccess, setAddSuccess] = useState<string | null>(null);
 
-  const [file, setFile] = useState<File | null>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
-  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  // Queue of background analysis jobs
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [files, setFiles] = useState<File[]>([]);
+  const [queueError, setQueueError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  function refresh() {
-    api.getVehicles().then((v) => setVehicles(v as Vehicle[])).catch(() => setVehicles(mockVehicles as Vehicle[]));
+  function refresh({ fallbackToMock = false } = {}) {
+    api.getVehicles()
+      .then((v) => setVehicles(v as Vehicle[]))
+      .catch(() => { if (fallbackToMock) setVehicles(mockVehicles as Vehicle[]); });
   }
 
-  useEffect(() => { refresh(); }, []);
+  useEffect(() => { refresh({ fallbackToMock: true }); }, []);
+
+  // Poll all processing jobs every 2 s
+  useEffect(() => {
+    const activeJobs = jobs.filter((j) => j.status === "processing");
+    if (activeJobs.length === 0) return;
+    const interval = setInterval(async () => {
+      const updates = await Promise.all(
+        activeJobs.map((j) => api.getAnalyzeJob(j.jobId).catch(() => null))
+      );
+      let anyDone = false;
+      setJobs((prev) =>
+        prev.map((j) => {
+          const u = updates.find((u) => u?.jobId === j.jobId);
+          if (!u || u.status === j.status) return j;
+          if (u.status === "done" || u.status === "error") anyDone = true;
+          return { ...j, status: u.status, result: u.result ?? null, error: u.error ?? null };
+        })
+      );
+      if (anyDone) refresh();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [jobs]);
 
   const parked       = vehicles.filter((v) => v.status === "PARKED").length;
   const moving       = vehicles.filter((v) => v.status === "MOVING").length;
@@ -145,26 +177,34 @@ export default function VehiclesPage() {
     } catch {}
   }
 
-  async function handleAnalyze() {
-    if (!file) return;
-    setAnalyzing(true);
-    setResult(null);
-    setAnalyzeError(null);
-    try {
-      const res: AnalysisResult = await api.analyzeVehicleVideo(file);
-      setResult(res);
-      refresh();
-    } catch (e: any) {
-      setAnalyzeError(e.message || "Analysis failed");
-    } finally {
-      setAnalyzing(false);
+  // Queue all selected files as background jobs
+  async function handleQueueVideos() {
+    if (files.length === 0) return;
+    setQueueError(null);
+    const toQueue = [...files];
+    setFiles([]);
+    for (const f of toQueue) {
+      try {
+        const { jobId, filename } = await api.analyzeVehicleVideo(f);
+        setJobs((prev) => [...prev, { jobId, filename, status: "processing", result: null, error: null }]);
+      } catch (e: any) {
+        setQueueError(`Failed to queue "${f.name}": ${e.message || "unknown error"}`);
+      }
     }
   }
 
   function handleDrop(e: React.DragEvent) {
     e.preventDefault();
-    const dropped = e.dataTransfer.files[0];
-    if (dropped && dropped.type.startsWith("video/")) setFile(dropped);
+    const dropped = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("video/"));
+    if (dropped.length) setFiles((prev) => [...prev, ...dropped]);
+  }
+
+  function removeFile(idx: number) {
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function removeJob(jobId: string) {
+    setJobs((prev) => prev.filter((j) => j.jobId !== jobId));
   }
 
   return (
@@ -344,128 +384,156 @@ export default function VehiclesPage() {
           </table>
         </div>
 
-        {/* Video Demo Analysis */}
+        {/* Video Analysis Queue */}
         <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5 space-y-4">
           <div className="flex items-center gap-2">
             <Upload className="h-4 w-4 text-blue-400" />
             <h2 className="text-sm font-semibold text-slate-200">Demo Video Analysis</h2>
-            <span className="text-xs text-slate-500">— upload a video to detect &amp; log number plates</span>
+            <span className="text-xs text-slate-500">— queue multiple videos; processing runs in the background</span>
           </div>
 
+          {/* Drop zone — accepts multiple files */}
           <div
             onDrop={handleDrop}
             onDragOver={(e) => e.preventDefault()}
-            onClick={() => !file && inputRef.current?.click()}
-            className={cn(
-              "relative flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-8 transition-colors cursor-pointer",
-              file ? "border-blue-500/40 bg-blue-500/5" : "border-slate-700 hover:border-slate-600"
-            )}
+            onClick={() => inputRef.current?.click()}
+            className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-700 hover:border-slate-600 p-6 transition-colors cursor-pointer"
           >
             <input
               ref={inputRef}
               type="file"
               accept="video/*"
+              multiple
               className="hidden"
-              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              onChange={(e) => {
+                const picked = Array.from(e.target.files ?? []).filter((f) => f.type.startsWith("video/"));
+                if (picked.length) setFiles((prev) => [...prev, ...picked]);
+                e.target.value = "";
+              }}
             />
-            {file ? (
-              <>
-                <Car className="h-8 w-8 text-blue-400" />
-                <p className="text-sm font-medium text-slate-200">{file.name}</p>
-                <p className="text-xs text-slate-500">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
-                <button
-                  onClick={(e) => { e.stopPropagation(); setFile(null); setResult(null); setAnalyzeError(null); }}
-                  className="absolute top-2 right-2 text-slate-500 hover:text-slate-300"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </>
-            ) : (
-              <>
-                <Upload className="h-8 w-8 text-slate-600" />
-                <p className="text-sm text-slate-400">Drop a video here or click to browse</p>
-                <p className="text-xs text-slate-600">MP4, AVI, MOV, MKV supported</p>
-              </>
-            )}
+            <Upload className="h-7 w-7 text-slate-600" />
+            <p className="text-sm text-slate-400">Drop videos here or click to browse</p>
+            <p className="text-xs text-slate-600">MP4, AVI, MOV, MKV — multiple files supported</p>
           </div>
 
-          {file && (
-            <button
-              onClick={handleAnalyze}
-              disabled={analyzing}
-              className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              {analyzing ? (
-                <><Loader2 className="h-4 w-4 animate-spin" /> Analyzing…</>
-              ) : (
-                <><Upload className="h-4 w-4" /> Analyze Video</>
-              )}
-            </button>
-          )}
-
-          {analyzeError && (
-            <div className="flex items-center gap-2 rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
-              <AlertCircle className="h-4 w-4 shrink-0" /> {analyzeError}
+          {/* Staged files waiting to be queued */}
+          {files.length > 0 && (
+            <div className="space-y-2">
+              {files.map((f, i) => (
+                <div key={i} className="flex items-center justify-between rounded-lg bg-slate-800/60 px-3 py-2 text-sm">
+                  <span className="flex items-center gap-2 text-slate-300 truncate">
+                    <Car className="h-3.5 w-3.5 text-blue-400 shrink-0" />
+                    <span className="truncate">{f.name}</span>
+                    <span className="text-slate-500 text-xs shrink-0">{(f.size / 1024 / 1024).toFixed(1)} MB</span>
+                  </span>
+                  <button onClick={() => removeFile(i)} className="text-slate-500 hover:text-slate-300 ml-2 shrink-0">
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+              <button
+                onClick={handleQueueVideos}
+                className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 transition-colors"
+              >
+                <Upload className="h-4 w-4" />
+                Queue {files.length} video{files.length > 1 ? "s" : ""} for analysis
+              </button>
             </div>
           )}
 
-          {result && (
+          {queueError && (
+            <div className="flex items-center gap-2 rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400">
+              <AlertCircle className="h-4 w-4 shrink-0" /> {queueError}
+            </div>
+          )}
+
+          {/* Job results list */}
+          {jobs.length > 0 && (
             <div className="space-y-3">
-              <div className="grid grid-cols-3 gap-3 text-center text-xs">
-                <div className="rounded-lg bg-slate-800/60 px-3 py-2">
-                  <p className="text-lg font-bold text-slate-200">{result.framesSampled}</p>
-                  <p className="text-slate-500">Frames sampled</p>
-                </div>
-                <div className="rounded-lg bg-slate-800/60 px-3 py-2">
-                  <p className="text-lg font-bold text-slate-200">{result.detectedPlates.length}</p>
-                  <p className="text-slate-500">Plates detected</p>
-                </div>
-                <div className="rounded-lg bg-slate-800/60 px-3 py-2">
-                  <p className="text-lg font-bold text-emerald-400">{result.confirmedPlates.length}</p>
-                  <p className="text-slate-500">Confirmed</p>
-                </div>
-              </div>
-
-              {result.added.length > 0 && (
-                <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3 space-y-1">
-                  <p className="text-xs font-semibold text-emerald-400 flex items-center gap-1">
-                    <CheckCircle className="h-3.5 w-3.5" /> Added to database ({result.added.length})
-                  </p>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {result.added.map((p) => (
-                      <span key={p} className="font-mono text-xs bg-emerald-500/10 text-emerald-300 px-2 py-0.5 rounded">{p}</span>
-                    ))}
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Analysis Queue</p>
+              {jobs.map((job) => (
+                <div key={job.jobId} className={cn(
+                  "rounded-lg border p-3 space-y-2",
+                  job.status === "processing" ? "border-blue-500/20 bg-blue-500/5" :
+                  job.status === "done"       ? "border-emerald-500/20 bg-emerald-500/5" :
+                                               "border-red-500/20 bg-red-500/5"
+                )}>
+                  <div className="flex items-center justify-between">
+                    <span className="flex items-center gap-2 text-sm font-medium text-slate-200 truncate">
+                      {job.status === "processing" && <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-400 shrink-0" />}
+                      {job.status === "done"       && <CheckCircle className="h-3.5 w-3.5 text-emerald-400 shrink-0" />}
+                      {job.status === "error"      && <AlertCircle className="h-3.5 w-3.5 text-red-400 shrink-0" />}
+                      <span className="truncate">{job.filename}</span>
+                    </span>
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
+                      <span className={cn(
+                        "text-xs px-2 py-0.5 rounded-full font-medium",
+                        job.status === "processing" ? "bg-blue-500/20 text-blue-400" :
+                        job.status === "done"       ? "bg-emerald-500/20 text-emerald-400" :
+                                                     "bg-red-500/20 text-red-400"
+                      )}>
+                        {job.status === "processing" ? "Processing…" : job.status === "done" ? "Done" : "Error"}
+                      </span>
+                      {job.status !== "processing" && (
+                        <button onClick={() => removeJob(job.jobId)} className="text-slate-500 hover:text-slate-300">
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
 
-              {result.updated.length > 0 && (
-                <div className="rounded-lg bg-blue-500/10 border border-blue-500/20 p-3 space-y-1">
-                  <p className="text-xs font-semibold text-blue-400 flex items-center gap-1">
-                    <CheckCircle className="h-3.5 w-3.5" /> Re-entry logged ({result.updated.length})
-                  </p>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {result.updated.map((p) => (
-                      <span key={p} className="font-mono text-xs bg-blue-500/10 text-blue-300 px-2 py-0.5 rounded">{p}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
+                  {job.status === "error" && (
+                    <p className="text-xs text-red-400">{job.error}</p>
+                  )}
 
-              {result.alreadyParked.length > 0 && (
-                <div className="rounded-lg bg-slate-800/60 border border-slate-700 p-3 space-y-1">
-                  <p className="text-xs font-semibold text-slate-400">Already parked — no change ({result.alreadyParked.length})</p>
-                  <div className="flex flex-wrap gap-2 mt-1">
-                    {result.alreadyParked.map((p) => (
-                      <span key={p} className="font-mono text-xs bg-slate-700 text-slate-400 px-2 py-0.5 rounded">{p}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
+                  {job.status === "done" && job.result && (
+                    <div className="space-y-2 pt-1">
+                      <div className="flex gap-3 text-xs text-center">
+                        <div className="rounded bg-slate-800/60 px-3 py-1.5 flex-1">
+                          <p className="font-bold text-slate-200">{job.result.framesSampled}</p>
+                          <p className="text-slate-500">Frames</p>
+                        </div>
+                        <div className="rounded bg-slate-800/60 px-3 py-1.5 flex-1">
+                          <p className="font-bold text-slate-200">{job.result.detectedPlates.length}</p>
+                          <p className="text-slate-500">Detected</p>
+                        </div>
+                        <div className="rounded bg-slate-800/60 px-3 py-1.5 flex-1">
+                          <p className="font-bold text-emerald-400">{job.result.confirmedPlates.length}</p>
+                          <p className="text-slate-500">Confirmed</p>
+                        </div>
+                      </div>
 
-              {result.confirmedPlates.length === 0 && (
-                <p className="text-xs text-slate-500 text-center py-2">No license plates were confidently detected in the video.</p>
-              )}
+                      {job.result.added.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className="text-xs text-emerald-400 font-medium">Added:</span>
+                          {job.result.added.map((p) => (
+                            <span key={p} className="font-mono text-xs bg-emerald-500/10 text-emerald-300 px-2 py-0.5 rounded">{p}</span>
+                          ))}
+                        </div>
+                      )}
+                      {job.result.updated.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className="text-xs text-blue-400 font-medium">Re-entered:</span>
+                          {job.result.updated.map((p) => (
+                            <span key={p} className="font-mono text-xs bg-blue-500/10 text-blue-300 px-2 py-0.5 rounded">{p}</span>
+                          ))}
+                        </div>
+                      )}
+                      {job.result.alreadyParked.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          <span className="text-xs text-slate-400 font-medium">Already parked:</span>
+                          {job.result.alreadyParked.map((p) => (
+                            <span key={p} className="font-mono text-xs bg-slate-700 text-slate-400 px-2 py-0.5 rounded">{p}</span>
+                          ))}
+                        </div>
+                      )}
+                      {job.result.confirmedPlates.length === 0 && (
+                        <p className="text-xs text-slate-500">No plates detected.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           )}
         </div>

@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.pt
+*.pth
+*.pkl
+*.h5
+*.onnx
+logs/
+faces/
+.env
+.env.*
+test_video.txt
+backend.log
+README.md

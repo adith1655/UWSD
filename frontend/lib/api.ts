@@ -127,6 +127,8 @@ export const api = {
     });
   },
 
+  getAnalyzeJob: (jobId: string) => request<any>(`/vehicles/analyze-jobs/${jobId}`),
+
   getUsers: () => request<any[]>("/users"),
 
   // Student-scoped endpoints
