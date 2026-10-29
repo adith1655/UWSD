@@ -53,9 +53,9 @@ function WebcamPanel() {
 
   // Load registered faces
   const loadFaces = () =>
-    api.getUsers ? fetch(`${API_URL}/faces`, {
+    fetch(`${API_URL}/faces`, {
       headers: { Authorization: `Bearer ${localStorage.getItem("uwsd_token")}` },
-    }).then(r => r.json()).then(setFaces).catch(() => {}) : Promise.resolve();
+    }).then(r => r.json()).then(setFaces).catch(() => {});
 
   useEffect(() => { loadFaces(); }, []);
 
