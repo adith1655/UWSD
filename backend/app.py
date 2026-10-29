@@ -21,10 +21,16 @@ import os
 import re
 import tempfile
 import uuid
+import spaces
+
+@spaces.GPU
+def _gpu_placeholder():
+    pass
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # ── Email alert config ────────────────────────────────────────────────────────
 ALERT_EMAIL_TO   = "aakashchy018@gmail.com"
@@ -312,9 +318,12 @@ def run_detection(frame: np.ndarray) -> list[dict]:
 
 app = FastAPI(title="UWSD API", version="1.0.0", description="Unified Watch & Surveillance Device API")
 
+_cors_origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -363,7 +372,7 @@ async def alerts_ws(websocket: WebSocket):
         if websocket in _alert_subscribers:
             _alert_subscribers.remove(websocket)
 
-SECRET_KEY = "uwsd-secret-key-2026-muj"
+SECRET_KEY = os.getenv("UWSD_SECRET_KEY", "uwsd-secret-key-2026-muj")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 
@@ -1160,29 +1169,41 @@ def _format_plate(raw: str) -> str:
 
 
 def _prepare_frame_for_ocr(frame_bgr):
-    """Upscale very small frames so plate text has enough pixels for OCR."""
+    """
+    Return a single preprocessed frame ready for OCR.
+    - Clamps to ≤1280px on the long side (EasyOCR is slower *and* noisier on very
+      large images because text occupies fewer relative pixels per token).
+    - Upscales tiny frames so plate glyphs have enough resolution.
+    - Applies CLAHE on the grayscale channel for better contrast under varied
+      lighting, then converts back to RGB (what EasyOCR expects).
+    """
     h, w = frame_bgr.shape[:2]
-    m = min(h, w)
-    if m < 480 and m > 0:
-        scale = 480 / m
+    if max(h, w) > 1280:
+        scale = 1280 / max(h, w)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        frame_bgr = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    elif min(h, w) < 480 and min(h, w) > 0:
+        scale = 480 / min(h, w)
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
         frame_bgr = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_CUBIC)
-    return frame_bgr
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    # EasyOCR accepts single-channel arrays — avoids an extra BGR→RGB conversion
+    return enhanced
 
 
 def _extract_plates_from_frame(frame_bgr, reader) -> list[str]:
     """
-    EasyOCR expects RGB. OpenCV gives BGR — convert or OCR quality is poor.
-    OCR often splits a plate across boxes; also scan joined text.
+    EasyOCR often splits a plate across boxes; scanning the joined string handles that.
     Do not globally replace O→0 / I→1: that breaks series codes like CA, CO, BH.
     """
-    frame_bgr = _prepare_frame_for_ocr(frame_bgr)
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    results = reader.readtext(frame_rgb, detail=0, paragraph=False)
+    frame_ready = _prepare_frame_for_ocr(frame_bgr)
+    results = reader.readtext(frame_ready, detail=0, paragraph=False)
     fragments = [str(t).strip().upper() for t in results if t and str(t).strip()]
     if not fragments:
         return []
-    # Single string of all detections (handles split "RJ14" + "CA 7742")
     blobs = fragments + [" ".join(fragments)]
     found: list[str] = []
     seen: set[str] = set()
@@ -1196,55 +1217,39 @@ def _extract_plates_from_frame(frame_bgr, reader) -> list[str]:
     return found
 
 
-@app.post("/vehicles/analyze-video")
-async def analyze_video(
-    file: UploadFile = File(...),
-    current_user=Depends(get_current_user),
-):
-    """
-    Accept a video upload, sample frames, run OCR to detect license plates,
-    and update vehicles_db accordingly.
-    Returns a summary of detections and DB changes.
-    """
-    # Save upload to a temp file
-    suffix = Path(file.filename).suffix if file.filename else ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+# ---------------------------------------------------------------------------
+# Background video-analysis job queue
+# ---------------------------------------------------------------------------
 
-    try:
-        reader = _get_ocr_reader()
-        cap = cv2.VideoCapture(tmp_path)
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Cannot open video file")
+_jobs: dict[str, dict] = {}   # job_id -> {status, filename, result, error}
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        sample_every = max(1, int(fps))          # one frame per second
-        detected: dict[str, int] = {}            # plate -> frame count
-        frame_idx = 0
-        frames_sampled = 0
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % sample_every == 0:
-                frames_sampled += 1
-                plates = _extract_plates_from_frame(frame, reader)
-                for p in plates:
-                    detected[p] = detected.get(p, 0) + 1
-            frame_idx += 1
+def _run_video_analysis(tmp_path: str) -> dict:
+    """Synchronous video analysis — runs in a thread pool worker."""
+    reader = _get_ocr_reader()
+    cap = cv2.VideoCapture(tmp_path)
+    if not cap.isOpened():
+        raise ValueError("Cannot open video file")
 
-        cap.release()
-    finally:
-        os.unlink(tmp_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    sample_every = max(1, int(fps))
+    detected: dict[str, int] = {}
+    frame_idx = 0
+    frames_sampled = 0
 
-    # ≥2 frames when we have enough samples (cuts noise); single hit OK for short clips
-    if frames_sampled >= 3:
-        confirmed = [p for p, cnt in detected.items() if cnt >= 2]
-    else:
-        confirmed = [p for p, cnt in detected.items() if cnt >= 1]
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % sample_every == 0:
+            frames_sampled += 1
+            for p in _extract_plates_from_frame(frame, reader):
+                detected[p] = detected.get(p, 0) + 1
+        frame_idx += 1
 
+    cap.release()
+
+    confirmed = list(detected.keys())
     added, updated, already_parked = [], [], []
     now_ts = datetime.now(timezone.utc).isoformat()
 
@@ -1254,38 +1259,87 @@ async def analyze_video(
             None,
         )
         if existing is None:
-            # New unknown vehicle — log as PARKED entry
-            new_entry = {
-                "id": f"ve{len(vehicles_db) + 1}",
-                "licensePlate": plate,
-                "ownerName": "Unknown",
-                "vehicleType": "Car",
-                "isRegistered": False,
+            vehicles_db.append({
+                "id":            f"ve{len(vehicles_db) + 1}",
+                "licensePlate":  plate,
+                "ownerName":     "Unknown",
+                "vehicleType":   "Car",
+                "isRegistered":  False,
                 "isBlacklisted": False,
-                "status": "PARKED",
-                "entryTime": now_ts,
-                "exitTime": None,
-            }
-            vehicles_db.append(new_entry)
+                "status":        "PARKED",
+                "entryTime":     now_ts,
+                "exitTime":      None,
+            })
             added.append(plate)
         elif existing["status"] == "EXITED":
-            # Vehicle re-entering
-            existing["status"] = "PARKED"
+            existing["status"]    = "PARKED"
             existing["entryTime"] = now_ts
-            existing["exitTime"] = None
+            existing["exitTime"]  = None
             updated.append(plate)
         else:
             already_parked.append(plate)
 
     return {
         "framesProcessed": frame_idx,
-        "framesSampled": frames_sampled,
-        "detectedPlates": list(detected.keys()),
+        "framesSampled":   frames_sampled,
+        "detectedPlates":  list(detected.keys()),
         "confirmedPlates": confirmed,
-        "added": added,
-        "updated": updated,
-        "alreadyParked": already_parked,
+        "added":           added,
+        "updated":         updated,
+        "alreadyParked":   already_parked,
     }
+
+
+def _job_worker(job_id: str, tmp_path: str) -> None:
+    try:
+        result = _run_video_analysis(tmp_path)
+        _jobs[job_id]["status"] = "done"
+        _jobs[job_id]["result"] = result
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"]  = str(exc)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/vehicles/analyze-video")
+async def analyze_video(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    """
+    Save the uploaded video and immediately return a job ID.
+    Processing happens in a background thread so the caller is not blocked.
+    Poll GET /vehicles/analyze-jobs/{job_id} for status and results.
+    """
+    suffix = Path(file.filename).suffix if file.filename else ".mp4"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "status":   "processing",
+        "filename": file.filename or "video",
+        "result":   None,
+        "error":    None,
+    }
+
+    asyncio.get_running_loop().run_in_executor(_executor, _job_worker, job_id, tmp_path)
+
+    return {"jobId": job_id, "status": "processing", "filename": file.filename or "video"}
+
+
+@app.get("/vehicles/analyze-jobs/{job_id}")
+def get_analyze_job(job_id: str, current_user=Depends(get_current_user)):
+    """Poll this endpoint to check if a background video analysis has finished."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"jobId": job_id, **job}
 
 # ---------------------------------------------------------------------------
 # Users
@@ -1630,4 +1684,5 @@ def test_rtsp_url(body: dict, current_user=Depends(get_current_user)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 7860))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)

@@ -1,8 +1,10 @@
+spaces
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 PyJWT>=2.8.0
 pydantic>=2.9.0
+werkzeug>=3.0.0
 deepface>=0.0.93
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 onnxruntime>=1.16.0
 easyocr>=1.7.0
